@@ -68,7 +68,7 @@ vlash run examples/inference/sync.yaml --action_quant_ratio=2
 ## TODO
 - [x] LoRA fine-tuning for $\pi_{0.5}$, $\pi_0$ under 12G GPU memory
 - [ ] QLoRA fine-tuning for $\pi_{0.5}$, $\pi_0$ under 8G GPU memory
-
+- [ ] Efficient fine-tuning with shared observation
 
 
 ## Acknowledgment
