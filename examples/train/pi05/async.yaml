@@ -1,55 +1,56 @@
 # VLASH Training Configuration for PI05 with Async Inference
+# Uses temporal delay to simulate real-world asynchronous inference latency
 
 # Policy configuration
 policy:
-  type: pi05
-  pretrained_path: lerobot/pi05_base
-  push_to_hub: false
-  dtype: bfloat16
-  device: cuda
-  state_cond: true
+  type: pi05                          # Policy architecture type
+  pretrained_path: lerobot/pi05_base  # HuggingFace model path for pretrained weights
+  push_to_hub: false                  # Whether to push trained model to HuggingFace Hub
+  dtype: bfloat16                     # Model precision (bfloat16 for memory efficiency)
+  device: cuda                        # Training device
+  state_cond: true                    # Enable state conditioning for future-aware training
 
 # Dataset configuration
 dataset:
-  repo_id: 
-  video_backend: torchcodec
+  repo_id:                            # HuggingFace dataset repository ID (required)
+  video_backend: torchcodec           # Video decoding backend
 
 # Training parameters
-output_dir: outputs/train/pi05_async
-job_name: pi05_async
-batch_size: 8
-steps: 50000
-num_workers: 4
-seed: 1000
+output_dir: outputs/train/pi05_async  # Directory to save outputs and checkpoints
+job_name: pi05_async                  # Job name for logging and identification
+batch_size: 8                         # Number of samples per training step
+steps: 50000                          # Total number of training steps
+num_workers: 4                        # DataLoader worker processes
+seed: 1000                            # Random seed for reproducibility
 
 # Optimizer configuration
-use_policy_training_preset: false
+use_policy_training_preset: false     # Use custom optimizer instead of policy defaults
 optimizer:
-  type: adamw
-  lr: 5.0e-5
-  betas: [0.9, 0.95]
-  weight_decay: 1.0e-10
+  type: adamw                         # AdamW optimizer with weight decay
+  lr: 5.0e-5                          # Learning rate
+  betas: [0.9, 0.95]                  # Adam beta parameters
+  weight_decay: 1.0e-10               # L2 regularization strength
 
 # Learning rate scheduler
 scheduler:
-  type: cosine_decay_with_warmup
-  num_warmup_steps: 1000
-  peak_lr: 5.0e-5
-  decay_lr: 2.5e-6
-  num_decay_steps: 50000
+  type: cosine_decay_with_warmup      # Cosine annealing with linear warmup
+  num_warmup_steps: 1000              # Steps to linearly increase LR from 0
+  peak_lr: 5.0e-5                     # Maximum learning rate after warmup
+  decay_lr: 2.5e-6                    # Final learning rate after decay
+  num_decay_steps: 50000              # Steps for cosine decay phase
 
 # Checkpointing
-save_checkpoint: true
-save_freq: 10000
-eval_freq: 10000
+save_checkpoint: true                 # Enable checkpoint saving
+save_freq: 10000                      # Save checkpoint every N steps
+eval_freq: 10000                      # Run evaluation every N steps
 
 # Logging
-log_freq: 200
+log_freq: 200                         # Log metrics every N steps
 wandb:
-  enable: true
-  project: vlash
-  entity: null
+  enable: true                        # Enable Weights & Biases logging
+  project: vlash                      # W&B project name
+  entity: null                        # W&B team/user (null for default)
 
-# Maximum temporal delay steps
-# Each sample will randomly delay by [0, 8] frames (inclusive)
+# VLASH async training: simulate inference delay
+# Each sample will randomly delay observation by [0, max_delay_steps] frames
 max_delay_steps: 8

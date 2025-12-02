@@ -15,7 +15,8 @@ robot:
 
 # Policy configuration
 policy:
-  path:  # Specify via CLI: --policy.path=...
+# Fill in the path to the policy checkpoint
+  path: <path to the policy checkpoint>
   n_action_steps: 32
   compile_model: true
   device: cuda
@@ -23,7 +24,7 @@ policy:
   fuse_gate_up: true
 
 # Task description passed to the policy
-single_task: Put all items into the bin.
+single_task: <task description>
 
 # Control parameters
 fps: 30  # Control loop frequency (Hz)

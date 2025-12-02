@@ -1,93 +1,96 @@
-# VLASH Training Configuration for PI05 with LoRA
-# This config enables PEFT-based LoRA on top of the PI05 policy.
+# VLASH Training Configuration for PI05 with LoRA + Async Inference
+# Memory-efficient fine-tuning using Low-Rank Adaptation (LoRA)
 
 # Policy configuration
 policy:
-  type: pi05
-  pretrained_path: lerobot/pi05_base
-  push_to_hub: false
-  dtype: bfloat16
-  device: cuda
-  state_cond: true
+  type: pi05                          # Policy architecture type
+  pretrained_path: lerobot/pi05_base  # HuggingFace model path for pretrained weights
+  push_to_hub: false                  # Whether to push trained model to HuggingFace Hub
+  dtype: bfloat16                     # Model precision (bfloat16 for memory efficiency)
+  device: cuda                        # Training device
+  state_cond: true                    # Enable state conditioning for future-aware training
 
 # Dataset configuration
 dataset:
-  repo_id: 
-  video_backend: torchcodec
+  repo_id:                            # HuggingFace dataset repository ID (required)
+  video_backend: torchcodec           # Video decoding backend
 
 # Training parameters
 output_dir: outputs/train/pi05_async_lora
 job_name: pi05_async_lora
-batch_size: 1
-grad_accum_steps: 8  # Effective batch size per optimizer step: 1 x 8 = 8
-steps: 50000
-num_workers: 4
-seed: 1000
+batch_size: 1                         # Small batch for memory efficiency with LoRA
+grad_accum_steps: 8                   # Gradient accumulation (effective batch = 1 x 8 = 8)
+steps: 50000                          # Total number of training steps
+num_workers: 4                        # DataLoader worker processes
+seed: 1000                            # Random seed for reproducibility
 
 # Optimizer configuration
-use_policy_training_preset: false
+use_policy_training_preset: false     # Use custom optimizer instead of policy defaults
 optimizer:
-  type: adamw
-  lr: 5.0e-5
-  betas: [0.9, 0.95]
-  weight_decay: 1.0e-10
+  type: adamw                         # AdamW optimizer with weight decay
+  lr: 5.0e-5                          # Learning rate
+  betas: [0.9, 0.95]                  # Adam beta parameters
+  weight_decay: 1.0e-10               # L2 regularization strength
 
 # Learning rate scheduler
 scheduler:
-  type: cosine_decay_with_warmup
-  num_warmup_steps: 1000
-  peak_lr: 5.0e-5
-  decay_lr: 2.5e-6
-  num_decay_steps: 50000
+  type: cosine_decay_with_warmup      # Cosine annealing with linear warmup
+  num_warmup_steps: 1000              # Steps to linearly increase LR from 0
+  peak_lr: 5.0e-5                     # Maximum learning rate after warmup
+  decay_lr: 2.5e-6                    # Final learning rate after decay
+  num_decay_steps: 50000              # Steps for cosine decay phase
 
 # Checkpointing
-save_checkpoint: true
-save_freq: 10000
-eval_freq: 10000
+save_checkpoint: true                 # Enable checkpoint saving
+save_freq: 10000                      # Save checkpoint every N steps
+eval_freq: 10000                      # Run evaluation every N steps
 
 # Logging
-log_freq: 200
+log_freq: 200                         # Log metrics every N steps
 wandb:
-  enable: true
-  project: vlash
-  entity: null
-  disable_artifact: true
+  enable: true                        # Enable Weights & Biases logging
+  project: vlash                      # W&B project name
+  entity: null                        # W&B team/user (null for default)
+  disable_artifact: true              # Disable artifact logging to save storage
 
-# VLASH-specific: Maximum temporal delay steps (set to 0 for standard training)
-max_delay_steps: 8
+# VLASH async training: simulate inference delay
+max_delay_steps: 8                    # Random delay from [0, 8] frames
 
-# LoRA configuration
-# The configuration is carefully crafted to maintain stability and performance.
+# LoRA (Low-Rank Adaptation) configuration
+# Enables parameter-efficient fine-tuning by freezing base model
 lora:
-  enable: true
-  backend: peft
-  extra_trainable_modules:  
-    - action_in_proj
-    - action_out_proj
-    - time_mlp_in
-    - time_mlp_out
-    - state_proj
-    - state_mlp_in
-    - state_mlp_out
-    - embeddings
+  enable: true                        # Enable LoRA fine-tuning
+  backend: peft                       # Use HuggingFace PEFT library
 
-    
-  r: 16
-  alpha: 16
-  dropout: 0
+  # Modules to fully train (not LoRA-adapted)
+  # These are typically small task-specific heads
+  extra_trainable_modules:
+    - action_in_proj                  # Action input projection
+    - action_out_proj                 # Action output projection
+    - time_mlp_in                     # Time embedding input layer
+    - time_mlp_out                    # Time embedding output layer
+    - state_proj                      # State projection layer
+    - state_mlp_in                    # State MLP input layer
+    - state_mlp_out                   # State MLP output layer
+    - embeddings                      # Token embeddings
+
+  # LoRA hyperparameters
+  r: 16                               # LoRA rank (lower = fewer params, higher = more capacity)
+  alpha: 16                           # LoRA scaling factor (alpha/r scales the adaptation)
+  dropout: 0                          # Dropout on LoRA layers (0 = disabled)
+
+  # Modules to apply LoRA adaptation
   target_modules:
-    - q_proj
-    - k_proj
-    - v_proj
-    - o_proj
-    - gate_proj
-    - up_proj
-    - down_proj
-    - out_proj
-    - fc1
-    - fc2
-    - dense
-    - embed_tokens
-    - lm_head
-
-
+    - q_proj                          # Query projection in attention
+    - k_proj                          # Key projection in attention
+    - v_proj                          # Value projection in attention
+    - o_proj                          # Output projection in attention
+    - gate_proj                       # Gate projection in MLP (for gated architectures)
+    - up_proj                         # Up projection in MLP
+    - down_proj                       # Down projection in MLP
+    - out_proj                        # Generic output projection
+    - fc1                             # First fully-connected layer
+    - fc2                             # Second fully-connected layer
+    - dense                           # Dense layers
+    - embed_tokens                    # Token embedding layer
+    - lm_head                         # Language model head
