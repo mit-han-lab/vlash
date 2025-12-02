@@ -35,7 +35,7 @@ VLASH is easy to use with:
 
 ## Demo
 
-[https://github.com/user-attachments/assets/773418ca-0d97-42c4-b568-943b48a90389](https://github.com/user-attachments/assets/773418ca-0d97-42c4-b568-943b48a90389)
+[https://github.com/user-attachments/assets/48f4a2db-5b88-4917-9064-63acd352be91](https://github.com/user-attachments/assets/48f4a2db-5b88-4917-9064-63acd352be91)
 
 ## Getting Started
 
