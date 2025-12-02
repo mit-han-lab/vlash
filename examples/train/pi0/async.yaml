@@ -7,7 +7,6 @@ policy:
   push_to_hub: false
   dtype: bfloat16
   device: cuda
-  state_cond: true
 
 # Dataset configuration
 dataset:
