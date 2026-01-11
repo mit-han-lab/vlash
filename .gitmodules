@@ -1,0 +1,3 @@
+[submodule "benchmarks/kinetix"]
+	path = benchmarks/kinetix
+	url = https://github.com/Sakits/vlash-kinetix.git
