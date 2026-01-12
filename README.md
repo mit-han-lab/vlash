@@ -1,80 +1,59 @@
-<!-- markdownlint-disable MD001 MD041 -->
+# VLASH-simulation-benchmark-LIBERO
 
-<p align="center">
-  <picture>
-    <img alt="VLASH" src="assets/logo.png" width=40%>
-  </picture>
-</p>
-<h3 align="center">
-Easy-to-use VLA deployment, fast to react, smooth in motion.
-</h3>
+This repo contains a VLASH fine-tuning and evaluation for **LIBERO** simulation benchmarks.
 
-<p align="center">
-    <a href="https://arxiv.org/abs/2512.01031"><b>Paper</b></a>
-</p>
+## Install
 
----
+1. **Create and activate your environment (example)**
 
-## About
+    ```bash
+    conda create -n vlash-libero python=3.10
+    conda activate vlash-libero
+    ```
 
-VLASH is an efficient and easy-to-use framework for VLAs fine-tuning and inference.
+2. **Install LIBERO**
 
-VLASH is efficient through:
+   Follow the installation instructions from this repo:  
+   https://github.com/Lifelong-Robot-Learning/LIBERO#installation
 
-- Asynchronous inference for **fast reaction and smooth motion** in real-time (**>30Hz inference frequency** for $\pi_{0.5}$ on RTX 5090)
-- Future-state-awareness to enable **stable asynchronous VLA inference without overhead**
-- Action quantization for **faster robot execution speed**
-- LoRA with shared observation encoding for **efficient fine-tuning on consumer GPUs**
+3. **Modify LIBERO Benchmark Initialization**
 
-VLASH is easy to use with:
+   In `LIBERO/libero/libero/benchmark/__init__.py`, replace:
+   ```python
+   init_states = torch.load(init_states_path)
+   ```
+   with:
+   ```python
+   init_states = torch.load(init_states_path, weights_only=False)
+   ```
 
-- **Seamless integration with [LeRobot](https://github.com/huggingface/lerobot)** datasets (v2.1, v3.0), models and robots
-- Simple YAML-based configuration system
-- Support for various policy architectures (e.g., $\pi_{0.5}$, $\pi_0$, ...)
-- Easy deployment on real robot hardware
+4. **Install VLASH**
 
-## Demo
+    ```bash
+    cd vlash
+    pip install -e .
+    ```
 
-[![Watch the video](assets/demo-first-frame.png)](https://www.youtube.com/watch?v=IgN7CNicJS8)
+5. **Check numpy version if you encounter segfaults**
 
-## Getting Started
+   If you experience segmentation faults, ensure you have numpy version 1.24.4:
+   ```bash
+   pip install numpy==1.24.4
+   ```
 
-```bash
-conda create -n "vlash" python=3.10
-conda activate vlash
-conda install ffmpeg=7.1.1 -c conda-forge
-pip install -e .
-```
+## Fine-tuning (LIBERO)
 
-### Quick Examples
-
-**Fine-tune a VLA policy for your task, enabling smooth async inference without overhead:**
+Example training config:
 
 ```bash
-vlash train examples/train/pi05/async.yaml
+vlash train examples/train/pi05/libero.yaml
 ```
 
-**Run async inference on a robot:**
+
+## Evaluate (LIBERO)
+
+Example (multi-GPU, 4 suites, async_delay sweep):
 
 ```bash
-vlash run examples/inference/async.yaml
+bash libero-eval-scripts/run.sh
 ```
-
-**Run async inference with 2x speedup:**
-```bash
-vlash run examples/inference/async.yaml --action_quant_ratio=2
-```
-
-## TODO
-- [x] LoRA fine-tuning for $\pi_{0.5}$, $\pi_0$ under 12G GPU memory
-- [ ] QLoRA fine-tuning for $\pi_{0.5}$, $\pi_0$ under 8G GPU memory
-- [x] Efficient fine-tuning with shared observation
-
-
-## Acknowledgment
-
-This project is built upon the following excellent open-source projects: [LeRobot](https://github.com/huggingface/lerobot), [PEFT](https://github.com/huggingface/peft).
-
-## License
-
-Apache 2.0
