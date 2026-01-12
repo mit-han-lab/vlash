@@ -112,6 +112,11 @@ def make_vlash_dataset(cfg: VLASHTrainConfig):
     delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
     
     # Determine which dataset class to use
+    # LIBERO training: use recorded future state s_{t+offset} instead of action proxy.
+    # This matches nano-lerobot-libero's async training behavior for LIBERO.
+    repo_id_str = str(cfg.dataset.repo_id or "")
+    use_state_ground_truth = "libero" in repo_id_str.lower()
+
     if cfg.shared_observation and cfg.max_delay_steps > 0:
         logging.info(
             f"Creating SharedObservationVLASHDataset with max_delay_steps={cfg.max_delay_steps} "
@@ -126,6 +131,7 @@ def make_vlash_dataset(cfg: VLASHTrainConfig):
             revision=cfg.dataset.revision,
             video_backend=cfg.dataset.video_backend,
             max_delay_steps=cfg.max_delay_steps,
+            use_state_ground_truth=use_state_ground_truth,
         )
     else:
         # Log the temporal delay configuration
@@ -147,6 +153,7 @@ def make_vlash_dataset(cfg: VLASHTrainConfig):
             revision=cfg.dataset.revision,
             video_backend=cfg.dataset.video_backend,
             max_delay_steps=cfg.max_delay_steps,
+            use_state_ground_truth=use_state_ground_truth,
         )
     
     # Apply ImageNet stats if requested (same as original make_dataset)
