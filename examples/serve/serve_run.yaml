@@ -1,0 +1,16 @@
+# VLASH Inference Server Configuration for PI05
+
+# Policy configuration
+policy:
+# Fill in the path to the policy checkpoint
+  path: <path to the policy checkpoint>
+  n_action_steps: 32  # Actions executed per inference
+  compile_model: true
+  device: cuda
+  fuse_qkv: true
+  fuse_gate_up: true
+
+# Server configuration
+port: 50051
+max_workers: 4
+max_message_size: 4194304  # 4 MB

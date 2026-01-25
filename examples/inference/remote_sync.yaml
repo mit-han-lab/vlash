@@ -1,0 +1,59 @@
+# VLASH Inference Configuration for PI05 (Synchronous, no overlap)
+
+# Robot configuration
+robot:
+  type: so101_follower
+  port: /dev/ttyACM2  # Update to match your robot's port
+  id: my_awesome_follower_arm
+  cameras:
+    wrist:
+      type: opencv
+      index_or_path: 0  # Update to match your camera
+      width: 640
+      height: 480
+      fps: 30
+
+# Policy configuration
+# This is for validation and configuration only; the policy is not loaded locally.
+policy:
+# Fill in the path to the policy checkpoint
+  path: <path to the policy checkpoint>
+  n_action_steps: 32
+  compile_model: true
+  device: cuda
+  fuse_qkv: true
+  fuse_gate_up: true
+
+# Task description passed to the policy
+single_task: <task description>
+
+# Control parameters
+fps: 30  # Control loop frequency (Hz)
+control_time_s: 600  # Total runtime (seconds)
+
+# Visualization
+display_data: true  # Camera feeds via rerun
+play_sounds: true  # Audio feedback
+
+# Action quantization factor
+action_quant_ratio: 1
+
+# Synchronous mode: no overlap between chunks
+inference_overlap_steps: 0
+
+# Remote Inference Configuration
+remote_inference:
+  # Server address (format: "host:port")
+  # Use "localhost:50051" for local testing
+  # Use actual IP for remote server, e.g., "192.168.1.100:50051"
+  server_address: <YOUR_SERVER_IP>:<YOUR_SERVER_PORT>
+  
+  # Maximum message size for gRPC (bytes)
+  # Increase if working with high-resolution images or large observations
+  max_message_size: 4194304  # 4 MB
+  
+  # Enable gRPC automatic retries on network failures
+  enable_retries: true
+  
+  # Maximum retry attempts
+  max_attempts: 5

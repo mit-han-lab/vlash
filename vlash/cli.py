@@ -18,12 +18,16 @@
 This module provides the main entry point for the VLASH CLI, supporting:
 - Training: Single/multi-GPU training with automatic detection
 - Inference: Run trained policies on robots  
+- Server: Start remote inference server
 - Benchmarking: Measure inference latency
 
 Usage:
     vlash train <config.yaml> [dataset_repo_id] [options]
     vlash run <config.yaml> [options]
+    vlash remote-run <config.yaml> [options]
     vlash benchmark <config.yaml> [options]
+    vlash remote-benchmark <config.yaml> [options]
+    vlash serve <config.yaml> [options]
 """
 
 import os
@@ -49,8 +53,14 @@ def main():
         train_command()
     elif command == "run":
         run_command()
+    elif command == "remote-run":
+        remote_run_command()
+    elif command == "serve":
+        serve_command()
     elif command == "benchmark":
         benchmark_command()
+    elif command == "remote-benchmark":
+        remote_benchmark_command()
     elif command in ["--help", "-h", "help"]:
         print_usage()
     else:
@@ -211,6 +221,41 @@ def run_command():
     run()
 
 
+def remote_run_command():
+    """Handle 'vlash remote-run' command for remote robot inference.
+    
+    Connects to a remote inference server and runs inference on a connected robot.
+    The config file specifies robot type, server address, and runtime settings.
+    """
+    if len(sys.argv) < 3:
+        print("Usage: vlash remote-run <config.yaml> [options]")
+        print("\nExamples:")
+        print("  vlash remote-run examples/inference/remote_async.yaml")
+        print("  vlash remote-run examples/inference/remote_async.yaml --remote_inference.server_address=192.168.1.100:50051")
+        print("  vlash remote-run examples/inference/remote_async.yaml --control_time_s=120")
+        sys.exit(1)
+    
+    config_path = sys.argv[2]
+    
+    # Validate config file exists
+    if not Path(config_path).exists():
+        print(f"Error: Config file not found: {config_path}")
+        sys.exit(1)
+    
+    print(f"Running remote inference with config: {config_path}")
+    
+    # Build arguments for the remote_run module
+    run_args = [f"--config_path={config_path}"]
+    run_args.extend(sys.argv[3:])
+    
+    # Import and execute the run function
+    from vlash.remote_run import run
+    
+    # Reconstruct sys.argv for draccus config parser
+    sys.argv = [sys.argv[0]] + run_args
+    run()
+
+
 def benchmark_command():
     """Handle 'vlash benchmark' command for performance measurement.
     
@@ -258,6 +303,90 @@ def benchmark_command():
         sys.exit(1)
 
 
+def remote_benchmark_command():
+    """Handle 'vlash remote-benchmark' command for remote performance measurement.
+    
+    Runs benchmarks to measure remote inference latency and throughput.
+    The benchmark type is determined by the 'type' field in the config file.
+    """
+    if len(sys.argv) < 3:
+        print("Usage: vlash remote-benchmark <config.yaml> [options]")
+        print("\nExamples:")
+        print("  vlash remote-benchmark examples/benchmark/remote_inference_latency.yaml")
+        print("  vlash remote-benchmark examples/benchmark/remote_inference_latency.yaml --num_samples=200")
+        print("  vlash remote-benchmark examples/benchmark/remote_inference_latency.yaml --remote_inference.server_address=192.168.1.100:50051")
+        sys.exit(1)
+    
+    config_path = sys.argv[2]
+    
+    # Validate config file exists
+    if not Path(config_path).exists():
+        print(f"Error: Config file not found: {config_path}")
+        sys.exit(1)
+    
+    print(f"Running remote benchmark with config: {config_path}")
+    
+    # Parse config to determine which benchmark to run
+    import yaml
+    with open(config_path, 'r') as f:
+        config_dict = yaml.safe_load(f)
+    
+    benchmark_type = config_dict.get('type', None)
+    
+    # Build arguments for the benchmark module
+    benchmark_args = [f"--config_path={config_path}"]
+    benchmark_args.extend(sys.argv[3:])
+    
+    # Reconstruct sys.argv for draccus config parser
+    sys.argv = [sys.argv[0]] + benchmark_args
+    
+    # Dispatch to the appropriate benchmark based on type
+    if benchmark_type == "inference_latency":
+        print(f"Running remote inference latency benchmark...")
+        from benchmarks.remote_benchmark_inference_latency import remote_benchmark_inference_latency
+        remote_benchmark_inference_latency()
+    else:
+        print(f"Error: Unknown benchmark type: {benchmark_type}")
+        sys.exit(1)
+
+
+def serve_command():
+    """Handle 'vlash serve' command for remote inference server.
+    
+    Starts a gRPC server that accepts inference requests from remote clients.
+    The server loads a policy and dataset metadata from the config file.
+    """
+    if len(sys.argv) < 3:
+        print("Usage: vlash serve <config.yaml> [options]")
+        print("\nExamples:")
+        print("  vlash serve examples/serve/serve_run.yaml")
+        print("  vlash serve examples/serve/serve_run.yaml --port=50052")
+        print("  vlash serve examples/serve/serve_run.yaml --policy.path=outputs/train/pi05/checkpoints/050000/pretrained_model")
+        print("  vlash serve examples/serve/serve_benchmark.yaml")
+        print("  vlash serve examples/serve/serve_benchmark.yaml --dataset.repo_id=lerobot/pusht")
+        sys.exit(1)
+    
+    config_path = sys.argv[2]
+    
+    # Validate config file exists
+    if not Path(config_path).exists():
+        print(f"Error: Config file not found: {config_path}")
+        sys.exit(1)
+    
+    print(f"Starting server with config: {config_path}")
+    
+    # Build arguments for the serve module
+    serve_args = [f"--config_path={config_path}"]
+    serve_args.extend(sys.argv[3:])
+    
+    # Import and execute the serve function
+    from vlash.serve import serve_from_config
+    
+    # Reconstruct sys.argv for draccus config parser
+    sys.argv = [sys.argv[0]] + serve_args
+    serve_from_config()
+
+
 def print_usage():
     """Print CLI usage information and examples."""
     print("""
@@ -273,8 +402,17 @@ Commands:
   run <config.yaml> [options]
       Run inference with a trained policy on a robot
   
+  remote-run <config.yaml> [options]
+      Run inference with a remote inference server on a robot
+  
   benchmark <config.yaml> [options]
       Benchmark inference latency of a trained policy
+  
+  remote-benchmark <config.yaml> [options]
+      Benchmark remote inference latency
+  
+  serve <config.yaml> [options]
+      Start a remote inference server
 
   help, --help, -h
       Show this help message
@@ -302,12 +440,40 @@ Inference Examples:
   # Override control time and overlap settings
   vlash run examples/inference/async.yaml --control_time_s=120 --inference_overlap_steps=6
 
+Remote Inference Examples:
+  # Run remote inference with default settings
+  vlash remote-run examples/inference/remote_async.yaml
+
+  # Override server address
+  vlash remote-run examples/inference/remote_async.yaml --remote_inference.server_address=192.168.1.100:50051
+
+  # Override control time and overlap settings
+  vlash remote-run examples/inference/remote_async.yaml --control_time_s=120 --inference_overlap_steps=6
+
 Benchmark Examples:
   # Benchmark inference latency
   vlash benchmark examples/benchmark/inference_latency.yaml
 
   # Override number of samples and output file
   vlash benchmark examples/benchmark/inference_latency.yaml --num_samples=200 --output_file=results/latency.json
+
+Remote Benchmark Examples:
+  # Benchmark remote inference latency
+  vlash remote-benchmark examples/benchmark/remote_inference_latency.yaml
+
+  # Override server address and number of samples
+  vlash remote-benchmark examples/benchmark/remote_inference_latency.yaml --remote_inference.server_address=192.168.1.100:50051 --num_samples=200
+
+Server Examples:
+  # Start inference server with default settings
+  vlash serve examples/serve/serve_run.yaml
+  vlash serve examples/serve/serve_benchmark.yaml
+
+  # Override port
+  vlash serve examples/serve/serve_run.yaml --port=50052
+
+  # Override policy path
+  vlash serve examples/serve/serve_run.yaml --policy.path=outputs/train/pi05/checkpoints/050000/pretrained_model
 
 For more information, see:
   https://github.com/mit-han-lab/vlash

@@ -17,13 +17,18 @@
 
 This module provides tools for benchmarking VLASH policy performance:
 - BenchmarkConfig: Configuration for benchmark runs
+- RemoteBenchmarkConfig: Configuration for remote inference benchmarks
 - benchmark_inference_latency: Measure inference latency statistics
+- remote_benchmark_inference_latency: Measure remote inference latency statistics
 
 Usage:
     vlash benchmark config.yaml --num_samples=100 --warmup_steps=10
+    vlash remote-benchmark config.yaml --num_samples=100 --warmup_steps=10
 """
 
 from benchmarks.benchmark_config import BenchmarkConfig
+from benchmarks.remote_benchmark_config import RemoteBenchmarkConfig
 from benchmarks.benchmark_inference_latency import benchmark_inference_latency
+from benchmarks.remote_benchmark_inference_latency import remote_benchmark_inference_latency
 
-__all__ = ["BenchmarkConfig", "benchmark_inference_latency"]
+__all__ = ["BenchmarkConfig", "RemoteBenchmarkConfig", "benchmark_inference_latency", "remote_benchmark_inference_latency"]

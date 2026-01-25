@@ -1,0 +1,24 @@
+# VLASH Inference Server Configuration for Benchmarking PI05
+
+# Policy configuration
+policy:
+  type: pi05
+  device: cuda
+  dtype: bfloat16
+  
+  # Enable torch.compile for optimized inference
+  compile_model: true
+  
+  # Enable attention/MLP fusion for faster inference
+  fuse_qkv: true
+  fuse_gate_up: true
+
+# Dataset configuration
+dataset:
+  repo_id: lerobot/pusht # Change to your dataset
+  streaming: false
+
+# Server configuration
+port: 50051
+max_workers: 4
+max_message_size: 4194304  # 4 MB

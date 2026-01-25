@@ -17,10 +17,16 @@
 This module provides configuration classes for VLASH training and inference:
 - VLASHTrainConfig: Training configuration with LoRA and temporal delay
 - RunConfig: Inference configuration for real robot deployment
+- RemoteInferenceConfig: Remote inference server connection configuration
+- RemoteRunConfig: Remote inference runtime configuration
+- ServerConfig: Remote inference server configuration
 """
 
 from vlash.configs.run_config import RunConfig
 from vlash.configs.train_config import VLASHTrainConfig
+from vlash.configs.remote_config import RemoteInferenceConfig
+from vlash.configs.remote_run_config import RemoteRunConfig
+from vlash.configs.serve_config import ServerConfig
 from vlash.policies.pi05 import PI05Config
 from vlash.policies.pi0 import PI0Config
 
@@ -32,4 +38,4 @@ from lerobot.configs.policies import PreTrainedConfig as _LRPreTrainedConfig
 _LRPreTrainedConfig._choice_registry["pi05"] = PI05Config
 _LRPreTrainedConfig._choice_registry["pi0"] = PI0Config
 
-__all__ = ["RunConfig", "VLASHTrainConfig", "PI05Config", "PI0Config"]
+__all__ = ["RunConfig", "VLASHTrainConfig", "PI05Config", "PI0Config", "RemoteRunConfig", "RemoteInferenceConfig", "ServerConfig"]
