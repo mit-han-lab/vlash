@@ -428,7 +428,7 @@ def serve_from_config(cfg: ServerConfig):
     except KeyboardInterrupt:
         logging.info("Shutting down server...")
         servicer.shutdown()
-        server.stop(grace=5)
+        server.stop(0)
         logging.info("Server stopped")
 
 
