@@ -65,6 +65,30 @@ vlash run examples/inference/async.yaml
 vlash run examples/inference/async.yaml --action_quant_ratio=2
 ```
 
+**Run remote inference:**
+
+For benchmarking:
+```bash
+# on the remote server
+vlash serve examples/serve/serve_benchmark.yaml
+
+# wait until the server is ready
+
+# on the local machine
+vlash remote-benchmark examples/benchmarks/remote_inference_latency.yaml
+```
+
+For running:
+```bash
+# on the remote server
+vlash serve examples/serve/serve_run.yaml
+
+# wait until the server is ready
+
+# on the local machine
+vlash remote-run examples/inference/remote_async.yaml
+```
+
 ## TODO
 - [x] LoRA fine-tuning for $\pi_{0.5}$, $\pi_0$ under 12G GPU memory
 - [ ] QLoRA fine-tuning for $\pi_{0.5}$, $\pi_0$ under 8G GPU memory
