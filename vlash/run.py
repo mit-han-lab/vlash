@@ -44,14 +44,15 @@ from lerobot.robots import Robot, make_robot_from_config
 from lerobot.utils.constants import OBS_IMAGES
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
-    prepare_observation_for_inference,
 )
+
 from lerobot.utils.robot_utils import busy_wait
 from lerobot.utils.utils import get_safe_torch_device, init_logging, log_say
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 from vlash.configs import RunConfig
 from vlash.policies.factory import get_policy_class
+from vlash.utils import prepare_observation_for_inference
 
 
 class VLASHAsyncManager:
