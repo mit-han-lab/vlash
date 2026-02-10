@@ -39,6 +39,8 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.utils import dataset_to_policy_features
+from lerobot.envs.configs import EnvConfig
+from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.pretrained import PreTrainedPolicy
 
 
@@ -67,26 +69,34 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
 def make_policy(
     cfg: PreTrainedConfig,
-    ds_meta: LeRobotDatasetMetadata,
+    ds_meta: LeRobotDatasetMetadata | None = None,
+    env_cfg: EnvConfig | None = None,
 ) -> PreTrainedPolicy:
     """Create a policy instance from configuration and dataset metadata.
     
     Args:
         cfg: Policy configuration with type, device, pretrained_path, etc.
         ds_meta: Dataset metadata containing feature definitions and stats.
+        env_cfg: Environment config to infer features when ds_meta is not available.
         
     Returns:
         Initialized policy ready for training or inference.
     """
+    if bool(ds_meta) == bool(env_cfg):
+        raise ValueError("Provide exactly one of ds_meta or env_cfg.")
+
     policy_cls = get_policy_class(cfg.type)
 
     kwargs: dict[str, Any] = {}
 
-    # Pass dataset statistics for normalization
-    kwargs["dataset_stats"] = ds_meta.stats
-
-    # Convert dataset features to policy feature format
-    features = dataset_to_policy_features(ds_meta.features)
+    if ds_meta is not None:
+        # Pass dataset statistics for normalization
+        kwargs["dataset_stats"] = ds_meta.stats
+        # Convert dataset features to policy feature format
+        features = dataset_to_policy_features(ds_meta.features)
+    else:
+        # Env-based feature inference (no dataset stats available)
+        features = env_to_policy_features(env_cfg)
     
     # Set output features (actions) if not already configured
     if not cfg.output_features:

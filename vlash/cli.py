@@ -51,6 +51,8 @@ def main():
         run_command()
     elif command == "benchmark":
         benchmark_command()
+    elif command in ["eval-libero", "eval_libero"]:
+        eval_libero_command()
     elif command in ["--help", "-h", "help"]:
         print_usage()
     else:
@@ -258,6 +260,16 @@ def benchmark_command():
         sys.exit(1)
 
 
+def eval_libero_command():
+    args = sys.argv[2:]
+    if args and args[0] == "--":
+        args = args[1:]
+
+    cmd = [sys.executable, "-m", "vlash.eval_libero", *args]
+    result = subprocess.run(cmd)
+    sys.exit(result.returncode)
+
+
 def print_usage():
     """Print CLI usage information and examples."""
     print("""
@@ -275,6 +287,9 @@ Commands:
   
   benchmark <config.yaml> [options]
       Benchmark inference latency of a trained policy
+
+  eval-libero [args...]
+      Run LIBERO evaluation via `vlash.eval_libero`
 
   help, --help, -h
       Show this help message
@@ -308,6 +323,11 @@ Benchmark Examples:
 
   # Override number of samples and output file
   vlash benchmark examples/benchmark/inference_latency.yaml --num_samples=200 --output_file=results/latency.json
+
+LIBERO Eval (in vlash) Examples:
+  vlash eval-libero \\
+    --policy.path=/path/to/pretrained_model \\
+    --env.type=libero --env.task=libero_spatial --eval.n_episodes=500
 
 For more information, see:
   https://github.com/mit-han-lab/vlash
