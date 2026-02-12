@@ -16,6 +16,7 @@ policy:
   # Enable attention/MLP fusion for faster inference
   fuse_qkv: true
   fuse_gate_up: true
+  fuse_adarms: true
 
 # Dataset configuration
 dataset:

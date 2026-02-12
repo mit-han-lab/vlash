@@ -49,6 +49,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from vlash.policies.normalize import Normalize, Unnormalize
 from vlash.policies.pi0.configuration_pi0 import PI0Config
 from vlash.policies.pi0.utils import (
+    compute_sinusoidal_scaling_factor,
     create_sinusoidal_pos_embedding,
     pad_vector,
     build_attention_mask_and_position_ids,
@@ -91,11 +92,14 @@ class PI0PrefixEmbedder(nn.Module):
         pad_masks = []
         att_masks = []
 
-        # Embed each image
-        for img, img_mask in zip(images, img_masks, strict=True):
-            img_emb = self.img_embedder(img)
-            bsz, num_img_embs = img_emb.shape[:2]
+        # Embed all images in a single batched forward pass
+        bsz = images[0].shape[0]
+        batched_imgs = torch.cat(images, dim=0)  # [N*B, C, H, W]
+        batched_emb = self.img_embedder(batched_imgs)  # [N*B, num_img_embs, D]
+        num_img_embs = batched_emb.shape[1]
+        img_embs = batched_emb.split(bsz, dim=0)  # list of [B, num_img_embs, D]
 
+        for img_emb, img_mask in zip(img_embs, img_masks, strict=True):
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsz, num_img_embs))
             att_masks += [0] * num_img_embs
@@ -137,6 +141,17 @@ class PI0SuffixEmbedder(nn.Module):
         self.action_time_mlp_in = nn.Linear(width * 2, width)
         self.action_time_mlp_out = nn.Linear(width, width)
 
+        # Pre-compute static sinusoidal scaling factor (avoids linspace/pow/reciprocal per step)
+        self.register_buffer(
+            "_time_scaling_factor",
+            compute_sinusoidal_scaling_factor(
+                width,
+                config.min_period,
+                config.max_period,
+            ),
+            persistent=False,
+        )
+
     def forward(self, state, noisy_actions, time):
         """Embed state and noisy actions with time conditioning.
         
@@ -166,13 +181,14 @@ class PI0SuffixEmbedder(nn.Module):
         # Mark boundary: prefix tokens don't attend to suffix
         att_masks.append(1)
 
-        # Time embedding (sinusoidal)
+        # Time embedding (sinusoidal, using cached scaling factor)
         time_emb = create_sinusoidal_pos_embedding(
             time,
             self.config.action_expert_config.hidden_size,
             min_period=self.config.min_period,
             max_period=self.config.max_period,
             device=time.device,
+            scaling_factor=self._time_scaling_factor,
         )
         time_emb = time_emb.to(dtype=time.dtype)
 
@@ -986,13 +1002,22 @@ class PI0Policy(PreTrainedPolicy):
         instance.to(config.device)
         instance.eval()
 
-        # Apply fusion for faster inference
-        if getattr(config, "fuse_qkv", True):
-            instance.model.init_qkv_fusion_from_existing()
-        if getattr(config, "fuse_gate_up", True):
-            instance.model.init_mlp_fusion_from_existing()
+        # Apply fusion optimizations
+        instance.apply_fusion_optimizations()
 
         return instance
+
+    def apply_fusion_optimizations(self):
+        """Apply weight fusion optimizations based on config flags.
+
+        Fuses QKV and gate/up projections for faster inference.
+        Must be called AFTER weights are loaded.
+        """
+        config = self.config
+        if getattr(config, "fuse_qkv", False):
+            self.model.init_qkv_fusion_from_existing()
+        if getattr(config, "fuse_gate_up", False):
+            self.model.init_mlp_fusion_from_existing()
 
     def reset(self):
         """Reset action queue. Call when environment resets."""

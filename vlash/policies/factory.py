@@ -108,6 +108,9 @@ def make_policy(
         )
     else:
         policy = policy_cls(**kwargs)
+        # Apply fusion optimizations (from_pretrained does this internally)
+        if hasattr(policy, "apply_fusion_optimizations"):
+            policy.apply_fusion_optimizations()
 
     # Move to target device and set to eval mode
     policy.to(cfg.device)

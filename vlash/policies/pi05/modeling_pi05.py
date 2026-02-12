@@ -50,6 +50,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from vlash.policies.normalize import Normalize, Unnormalize
 from vlash.policies.pi05.configuration_pi05 import PI05Config
 from vlash.policies.pi05.utils import (
+    compute_sinusoidal_scaling_factor,
     create_sinusoidal_pos_embedding,
     pad_vector,
     build_attention_mask_and_position_ids,
@@ -96,11 +97,14 @@ class PI05PrefixEmbedder(nn.Module):
         pad_masks = []
         att_masks = []
 
-        # Embed each image
-        for img, img_mask in zip(images, img_masks, strict=True):
-            img_emb = self.img_embedder(img)
-            bsz, num_img_embs = img_emb.shape[:2]
+        # Embed all images in a single batched forward pass
+        bsz = images[0].shape[0]
+        batched_imgs = torch.cat(images, dim=0)  # [N*B, C, H, W]
+        batched_emb = self.img_embedder(batched_imgs)  # [N*B, num_img_embs, D]
+        num_img_embs = batched_emb.shape[1]
+        img_embs = batched_emb.split(bsz, dim=0)  # list of [B, num_img_embs, D]
 
+        for img_emb, img_mask in zip(img_embs, img_masks, strict=True):
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsz, num_img_embs))
             att_masks += [0] * num_img_embs  # Images use standard attention
@@ -148,6 +152,17 @@ class PI05SuffixEmbedder(nn.Module):
         self.time_mlp_in = nn.Linear(config.action_expert_config.hidden_size, config.action_expert_config.hidden_size)
         self.time_mlp_out = nn.Linear(config.action_expert_config.hidden_size, config.action_expert_config.hidden_size)
 
+        # Pre-compute static sinusoidal scaling factor (avoids linspace/pow/reciprocal per step)
+        self.register_buffer(
+            "_time_scaling_factor",
+            compute_sinusoidal_scaling_factor(
+                config.action_expert_config.hidden_size,
+                config.min_period,
+                config.max_period,
+            ),
+            persistent=False,
+        )
+
         # Optional state conditioning MLP
         if config.state_cond:
             self.state_proj = nn.Linear(config.max_state_dim, config.action_expert_config.hidden_size)
@@ -171,13 +186,14 @@ class PI05SuffixEmbedder(nn.Module):
             att_masks: Attention masks [B, T].
             adarms_cond: Conditioning signal for adaRMS [B, D].
         """
-        # Create sinusoidal time embedding
+        # Create sinusoidal time embedding (using cached scaling factor)
         time_emb = create_sinusoidal_pos_embedding(
             time,
             self.config.action_expert_config.hidden_size,
             min_period=self.config.min_period,
             max_period=self.config.max_period,
             device=time.device,
+            scaling_factor=self._time_scaling_factor,
         )
         time_emb = time_emb.to(dtype=time.dtype)
         
@@ -359,6 +375,32 @@ class PI05MLP(nn.Module):
         return outputs
 
 
+def _apply_adarms_modulation(norm, x, modulation):
+    """Apply RMSNorm with pre-computed adaRMS modulation (bypasses norm.dense).
+
+    This is used when all adaRMS dense projections have been fused into a single
+    GEMM. The modulation tensor is already the output of the dense projection.
+
+    Args:
+        norm: GemmaRMSNorm module (only uses _norm for variance normalization).
+        x: Input tensor [B, L, D] or [B, D].
+        modulation: Pre-computed dense output [B, D*3].
+
+    Returns:
+        normed: Normalized and modulated tensor, same shape as x.
+        gate: Gate tensor for gated residual connection.
+    """
+    dtype = x.dtype
+    normed = norm._norm(x)
+
+    if len(x.shape) == 3:  # [B, L, D]
+        modulation = modulation.unsqueeze(1)  # [B, 1, D*3]
+
+    scale, shift, gate = torch.chunk(modulation, 3, dim=-1)
+    normed = normed * (1 + scale.to(torch.float32)) + shift.to(torch.float32)
+    return normed.to(dtype), gate.to(dtype)
+
+
 class PI05ModelLayer(nn.Module):
     """Single transformer layer for PI0.5.
     
@@ -385,7 +427,37 @@ class PI05ModelLayer(nn.Module):
         )
         self.mlp = PI05MLP(config, vlm_layer.mlp, action_expert_layer.mlp)
 
-    def forward(self, hidden_states, attention_mask, position_ids, conds, use_cache: bool = False):
+    def _norm_hidden_states(self, norms, hidden_states, conds, precomputed_modulations, mod_index):
+        """Apply layernorm to hidden states with optional pre-computed adaRMS modulation.
+
+        Args:
+            norms: [vlm_norm, expert_norm] layernorm modules.
+            hidden_states: [vlm_hidden, expert_hidden].
+            conds: [vlm_cond, expert_cond] raw conditioning signals.
+            precomputed_modulations: If not None, (input_mod, post_attn_mod) tuple
+                where each is [B, D*3] pre-computed dense output.
+            mod_index: 0 for input_layernorm modulation, 1 for post_attention_layernorm.
+
+        Returns:
+            hidden_states: Updated hidden states (in-place).
+            gates: List of gate tensors for gated residual.
+        """
+        gates = []
+        for i in range(len(hidden_states)):
+            hs = hidden_states[i]
+            if hs is None:
+                gates.append(None)
+                continue
+            if i == 1 and precomputed_modulations is not None:
+                hidden_states[i], gate = _apply_adarms_modulation(
+                    norms[i], hs, precomputed_modulations[mod_index])
+            else:
+                hidden_states[i], gate = norms[i](hs, conds[i])
+            gates.append(gate)
+        return hidden_states, gates
+
+    def forward(self, hidden_states, attention_mask, position_ids, conds, use_cache: bool = False,
+                precomputed_modulations=None):
         """Forward pass through transformer layer.
         
         Uses pre-norm architecture with gated residual connections.
@@ -396,20 +468,17 @@ class PI05ModelLayer(nn.Module):
             position_ids: Position IDs.
             conds: Conditioning signals for adaRMS.
             use_cache: Whether to use KV caching.
+            precomputed_modulations: Optional (input_mod, post_attn_mod) tuple of
+                pre-computed dense outputs, each [B, D*3]. When provided, bypasses
+                the per-norm dense projection for the action expert (index 1).
             
         Returns:
             Updated hidden states.
         """
         # Pre-attention layernorm with gated residual
         residuals = [hs.clone() if hs is not None else None for hs in hidden_states]
-        gates = []
-        for i in range(len(hidden_states)):
-            hs = hidden_states[i]
-            if hs is None:
-                gates.append(None)
-                continue
-            hidden_states[i], gate = self.input_layernorm[i](hs, conds[i])
-            gates.append(gate)
+        hidden_states, gates = self._norm_hidden_states(
+            self.input_layernorm, hidden_states, conds, precomputed_modulations, 0)
 
         # Self-attention
         hidden_states = self.self_attn(hidden_states, attention_mask, position_ids, use_cache=use_cache)
@@ -423,14 +492,8 @@ class PI05ModelLayer(nn.Module):
 
         # Pre-MLP layernorm with gated residual
         residuals = [hs.clone() if hs is not None else None for hs in hidden_states]
-        gates = []
-        for i in range(len(hidden_states)):
-            hs = hidden_states[i]
-            if hs is None:
-                gates.append(None)
-                continue
-            hidden_states[i], gate = self.post_attention_layernorm[i](hs, conds[i])
-            gates.append(gate)
+        hidden_states, gates = self._norm_hidden_states(
+            self.post_attention_layernorm, hidden_states, conds, precomputed_modulations, 1)
 
         # MLP
         hidden_states = self.mlp(hidden_states)
@@ -451,7 +514,8 @@ class PI05ModelLayer(nn.Module):
         suffix_adarms_conds,  # [B, num_offsets, D]
         num_offsets: int,
         suffix_length: int,
-        use_cache: bool = False
+        use_cache: bool = False,
+        precomputed_modulations=None,
     ):
         """Forward pass for shared observation training.
         
@@ -467,6 +531,8 @@ class PI05ModelLayer(nn.Module):
             num_offsets: Number of offset branches.
             suffix_length: Length of each suffix branch.
             use_cache: Whether to use KV caching.
+            precomputed_modulations: Optional (input_mod, post_attn_mod) tuple of
+                pre-computed dense outputs, each [B*num_offsets, D*3].
             
         Returns:
             Updated hidden states.
@@ -489,16 +555,18 @@ class PI05ModelLayer(nn.Module):
         hidden_dim = suffix.shape[-1]
         suffix_flat = suffix.view(batch_size * num_offsets, suffix_length, hidden_dim)
         
-        # Reshape conditioning: [B, num_offsets, D] -> [B * num_offsets, D]
-        cond_flat = suffix_adarms_conds.view(batch_size * num_offsets, -1) if suffix_adarms_conds is not None else None
-        suffix_normed_flat, suffix_gate_flat = self.input_layernorm[1](suffix_flat, cond=cond_flat)
+        if precomputed_modulations is not None:
+            suffix_normed_flat, suffix_gate_flat = _apply_adarms_modulation(
+                self.input_layernorm[1], suffix_flat, precomputed_modulations[0])
+        else:
+            cond_flat = suffix_adarms_conds.view(batch_size * num_offsets, -1) if suffix_adarms_conds is not None else None
+            suffix_normed_flat, suffix_gate_flat = self.input_layernorm[1](suffix_flat, cond=cond_flat)
         
         # Reshape back: [B * num_offsets, suffix_length, D] -> [B, num_offsets * suffix_length, D]
         suffix_normed = suffix_normed_flat.view(batch_size, num_offsets * suffix_length, hidden_dim)
         hidden_states[1] = suffix_normed
         
-        # Handle gate: reshape [B * num_offsets, D] -> [B, num_offsets, D]
-        # Gate is derived from cond which is [B * num_offsets, D]
+        # Handle gate: reshape [B * num_offsets, 1, D] -> [B, num_offsets * suffix_length, D]
         suffix_gates = suffix_gate_flat.view(batch_size, num_offsets, -1)  # [B, num_offsets, D]
         suffix_gates = suffix_gates.unsqueeze(2).expand(-1, -1, suffix_length, -1)  # [B, num_offsets, suffix_length, D]
         suffix_gates = suffix_gates.reshape(batch_size, num_offsets * suffix_length, -1)  # [B, num_offsets * suffix_length, D]
@@ -529,14 +597,17 @@ class PI05ModelLayer(nn.Module):
         hidden_dim = suffix.shape[-1]
         suffix_flat = suffix.view(batch_size * num_offsets, suffix_length, hidden_dim)
         
-        cond_flat = suffix_adarms_conds.view(batch_size * num_offsets, -1) if suffix_adarms_conds is not None else None
-        
-        suffix_normed_flat, suffix_gate_flat = self.post_attention_layernorm[1](suffix_flat, cond=cond_flat)
+        if precomputed_modulations is not None:
+            suffix_normed_flat, suffix_gate_flat = _apply_adarms_modulation(
+                self.post_attention_layernorm[1], suffix_flat, precomputed_modulations[1])
+        else:
+            cond_flat = suffix_adarms_conds.view(batch_size * num_offsets, -1) if suffix_adarms_conds is not None else None
+            suffix_normed_flat, suffix_gate_flat = self.post_attention_layernorm[1](suffix_flat, cond=cond_flat)
         
         suffix_normed = suffix_normed_flat.view(batch_size, num_offsets * suffix_length, hidden_dim)
         hidden_states[1] = suffix_normed
         
-        # Handle gate: reshape [B * num_offsets, D] -> [B, num_offsets, D]
+        # Handle gate: reshape [B * num_offsets, 1, D] -> [B, num_offsets * suffix_length, D]
         suffix_gates = suffix_gate_flat.view(batch_size, num_offsets, -1)
         suffix_gates = suffix_gates.unsqueeze(2).expand(-1, -1, suffix_length, -1)
         suffix_gates = suffix_gates.reshape(batch_size, num_offsets * suffix_length, -1)
@@ -703,6 +774,76 @@ class PI05Model(nn.Module):
                 delattr(mlp, "gate_proj")
                 delattr(mlp, "up_proj")
 
+    def init_adarms_fusion(self) -> None:
+        """Fuse all adaRMS dense projections into a single GEMM.
+
+        Each action expert norm has a dense layer: Linear(cond_dim, dim*3) that
+        produces (scale, shift, gate) from the conditioning signal. Since the same
+        cond is shared across all layers, we can stack all these projections into
+        one large Linear and compute them in a single kernel launch.
+
+        Layout in the fused weight: for L layers, the order is:
+            [layer_0_input, layer_0_post_attn, layer_1_input, ..., final_norm]
+        Total: 2*L + 1 norms.
+        """
+        # Collect all action expert dense layers in canonical order
+        dense_layers = []
+        for layer in self.layers:
+            dense_layers.append(layer.input_layernorm[1].dense)
+            dense_layers.append(layer.post_attention_layernorm[1].dense)
+        dense_layers.append(self.action_expert.model.norm.dense)
+
+        num_norms = len(dense_layers)
+        cond_dim = dense_layers[0].in_features
+        out_per_norm = dense_layers[0].out_features  # dim * 3
+        total_out = num_norms * out_per_norm
+        has_bias = dense_layers[0].bias is not None
+
+        # Create fused projection
+        fused = nn.Linear(cond_dim, total_out, bias=has_bias)
+        fused.to(device=dense_layers[0].weight.device, dtype=dense_layers[0].weight.dtype)
+
+        # Pack weights from all norms into the fused layer
+        with torch.no_grad():
+            for i, dense in enumerate(dense_layers):
+                start = i * out_per_norm
+                end = (i + 1) * out_per_norm
+                fused.weight[start:end].copy_(dense.weight)
+                if has_bias:
+                    fused.bias[start:end].copy_(dense.bias)
+
+        self.fused_adarms_proj = fused
+        self._adarms_out_per_norm = out_per_norm
+
+        # Remove original dense layers to free memory
+        for layer in self.layers:
+            delattr(layer.input_layernorm[1], "dense")
+            delattr(layer.post_attention_layernorm[1], "dense")
+        delattr(self.action_expert.model.norm, "dense")
+
+    def _precompute_adarms(self, cond: torch.Tensor):
+        """Pre-compute all adaRMS modulations with a single fused GEMM.
+
+        Args:
+            cond: Conditioning signal [B, cond_dim] (or [B*num_offsets, cond_dim]).
+
+        Returns:
+            layer_modulations: List of (input_mod, post_attn_mod) per layer,
+                each tensor is [B, dim*3].
+            final_mod: Final norm modulation [B, dim*3].
+        """
+        all_mods = self.fused_adarms_proj(cond)  # [B, (2*L+1)*dim*3]
+        all_mods = all_mods.split(self._adarms_out_per_norm, dim=-1)
+        # all_mods: tuple of (2*L+1) tensors, each [B, dim*3]
+
+        num_layers = len(self.layers)
+        layer_modulations = [
+            (all_mods[2 * i], all_mods[2 * i + 1])
+            for i in range(num_layers)
+        ]
+        final_mod = all_mods[2 * num_layers]
+        return layer_modulations, final_mod
+
     def to_bfloat16_for_selected_params(self, precision: str = "bfloat16") -> None:
         """Convert model to bfloat16, keeping critical params in float32.
         
@@ -810,22 +951,31 @@ class PI05Model(nn.Module):
         hidden_states = [prefix_embs, suffix_embs]
         conds = [None, suffix_adarms_cond]
 
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask, position_ids, conds, use_cache=False)
+        # Pre-compute all adaRMS modulations with a single fused GEMM
+        if hasattr(self, "fused_adarms_proj"):
+            layer_mods, final_mod = self._precompute_adarms(suffix_adarms_cond)
+            for i, layer in enumerate(self.layers):
+                hidden_states = layer(hidden_states, attention_mask, position_ids, conds,
+                                      use_cache=False, precomputed_modulations=layer_mods[i])
+        else:
+            for layer in self.layers:
+                hidden_states = layer(hidden_states, attention_mask, position_ids, conds, use_cache=False)
+            final_mod = None
 
         # Final layer norm
-        norms = [self.vlm.language_model.norm, self.action_expert.model.norm]
-        final_hidden_states: list[torch.Tensor | None] = []
-        for i, hs in enumerate(hidden_states):
-            if hs is None:
-                final_hidden_states.append(None)
-                continue
-            hs, _ = norms[i](hs, cond=conds[i])
-            final_hidden_states.append(hs)
-        hidden_states = final_hidden_states
+        prefix_hidden = hidden_states[0]
+        if prefix_hidden is not None:
+            prefix_hidden, _ = self.vlm.language_model.norm(prefix_hidden, cond=None)
+
+        suffix_hidden = hidden_states[1]
+        if final_mod is not None:
+            suffix_hidden, _ = _apply_adarms_modulation(
+                self.action_expert.model.norm, suffix_hidden, final_mod)
+        else:
+            suffix_hidden, _ = self.action_expert.model.norm(suffix_hidden, cond=suffix_adarms_cond)
 
         # Project to action space
-        suffix_out = hidden_states[1][:, -self.config.chunk_size :]
+        suffix_out = suffix_hidden[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
         v_t = self.action_out_proj(suffix_out)
 
@@ -925,28 +1075,42 @@ class PI05Model(nn.Module):
         
         # Forward through transformer layers using shared observation method
         hidden_states = [prefix_embs, suffix_embs_concat]
+
+        # Pre-compute all adaRMS modulations with a single fused GEMM
+        # For shared observation, cond is [B*num_offsets, cond_dim]
+        if hasattr(self, "fused_adarms_proj"):
+            cond_flat = suffix_adarms_cond_flat  # [B*num_offsets, cond_dim]
+            layer_mods, final_mod = self._precompute_adarms(cond_flat)
+            for i, layer in enumerate(self.layers):
+                hidden_states = layer.forward_shared_observation(
+                    hidden_states, attention_mask, position_ids,
+                    suffix_adarms_conds, num_offsets, suffix_length,
+                    precomputed_modulations=layer_mods[i],
+                )
+        else:
+            for layer in self.layers:
+                hidden_states = layer.forward_shared_observation(
+                    hidden_states, attention_mask, position_ids,
+                    suffix_adarms_conds, num_offsets, suffix_length
+                )
+            final_mod = None
         
-        for layer in self.layers:
-            hidden_states = layer.forward_shared_observation(
-                hidden_states, attention_mask, position_ids,
-                suffix_adarms_conds, num_offsets, suffix_length
-            )
-        
-        # Final layer norm with per-offset conditioning
-        norms = [self.vlm.language_model.norm, self.action_expert.model.norm]
-        
+        # Final layer norm
         # Prefix: no conditioning
         prefix_out = hidden_states[0]
-        prefix_out, _ = norms[0](prefix_out, cond=None)
+        prefix_out, _ = self.vlm.language_model.norm(prefix_out, cond=None)
         
-        # Suffix: per-offset conditioning (parallelized)
+        # Suffix: per-offset conditioning
         suffix_out = hidden_states[1]
         hidden_dim = suffix_out.shape[-1]
         suffix_flat = suffix_out.view(batch_size * num_offsets, suffix_length, hidden_dim)
-        
-        cond_flat = suffix_adarms_conds.view(batch_size * num_offsets, -1) if suffix_adarms_conds is not None else None
-        
-        suffix_normed_flat, _ = norms[1](suffix_flat, cond=cond_flat)
+
+        if final_mod is not None:
+            suffix_normed_flat, _ = _apply_adarms_modulation(
+                self.action_expert.model.norm, suffix_flat, final_mod)
+        else:
+            cond_flat = suffix_adarms_conds.view(batch_size * num_offsets, -1) if suffix_adarms_conds is not None else None
+            suffix_normed_flat, _ = self.action_expert.model.norm(suffix_flat, cond=cond_flat)
         
         # Reshape: [B * num_offsets, suffix_length, D] -> [B, num_offsets, suffix_length, D]
         suffix_out = suffix_normed_flat.view(batch_size, num_offsets, suffix_length, hidden_dim)
@@ -1012,15 +1176,26 @@ class PI05Model(nn.Module):
         hidden_states = [None, suffix_embs]  # VLM uses cache, only process expert
         conds = [None, suffix_adarms_cond]
 
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask, position_ids, conds, use_cache=True)
+        # Pre-compute all adaRMS modulations with a single fused GEMM
+        if hasattr(self, "fused_adarms_proj"):
+            layer_mods, final_mod = self._precompute_adarms(suffix_adarms_cond)
+            for i, layer in enumerate(self.layers):
+                hidden_states = layer(hidden_states, attention_mask, position_ids, conds,
+                                      use_cache=True, precomputed_modulations=layer_mods[i])
+        else:
+            for layer in self.layers:
+                hidden_states = layer(hidden_states, attention_mask, position_ids, conds, use_cache=True)
+            final_mod = None
 
         # Final norm and projection
         suffix_hidden = hidden_states[1]
-        suffix_hidden, _ = self.action_expert.model.norm(suffix_hidden, cond=suffix_adarms_cond)
-        hidden_states[1] = suffix_hidden
+        if final_mod is not None:
+            suffix_hidden, _ = _apply_adarms_modulation(
+                self.action_expert.model.norm, suffix_hidden, final_mod)
+        else:
+            suffix_hidden, _ = self.action_expert.model.norm(suffix_hidden, cond=suffix_adarms_cond)
 
-        suffix_out = hidden_states[1][:, -self.config.chunk_size :]
+        suffix_out = suffix_hidden[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
         return self.action_out_proj(suffix_out)
 
@@ -1272,13 +1447,25 @@ class PI05Policy(PreTrainedPolicy):
         instance.to(config.device)
         instance.eval()
 
-        # Apply QKV/MLP fusion for faster inference (can be disabled for LoRA)
-        if getattr(config, "fuse_qkv", True):
-            instance.model.init_qkv_fusion_from_existing()
-        if getattr(config, "fuse_gate_up", True):
-            instance.model.init_mlp_fusion_from_existing()
+        # Apply fusion optimizations
+        instance.apply_fusion_optimizations()
 
         return instance
+
+    def apply_fusion_optimizations(self):
+        """Apply weight fusion optimizations based on config flags.
+
+        Fuses QKV, gate/up, and adaRMS projections for faster inference.
+        Must be called AFTER weights are loaded (not during __init__,
+        because from_pretrained loads weights after __init__).
+        """
+        config = self.config
+        if getattr(config, "fuse_qkv", False):
+            self.model.init_qkv_fusion_from_existing()
+        if getattr(config, "fuse_gate_up", False):
+            self.model.init_mlp_fusion_from_existing()
+        if getattr(config, "fuse_adarms", False):
+            self.model.init_adarms_fusion()
 
     def reset(self):
         """Reset action queue. Call when environment resets."""

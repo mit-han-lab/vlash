@@ -148,9 +148,10 @@ class PI05Config(PreTrainedConfig):
     compile_mode: str = "max-autotune"  # Torch compile mode
     device: str | None = None  # Target device (None = auto-detect)
 
-    # Attention/MLP fusion (for inference optimization)
+    # Attention/MLP/adaRMS fusion (for inference optimization)
     fuse_qkv: bool = False  # Fuse Q/K/V projections
     fuse_gate_up: bool = False  # Fuse gate/up projections in MLP
+    fuse_adarms: bool = False  # Fuse all adaRMS dense projections into single GEMM
 
     # === Optimizer Settings ===
     optimizer_lr: float = 2.5e-5  # Peak learning rate

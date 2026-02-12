@@ -23,6 +23,7 @@ policy:
   device: cuda
   fuse_qkv: true
   fuse_gate_up: true
+  fuse_adarms: true
 
 # Task description passed to the policy
 single_task: <task description>

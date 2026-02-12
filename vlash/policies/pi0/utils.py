@@ -69,12 +69,45 @@ def get_safe_dtype(dtype: torch.dtype, device: str | torch.device) -> torch.dtyp
         return dtype
 
 
+def compute_sinusoidal_scaling_factor(
+    dimension: int,
+    min_period: float,
+    max_period: float,
+    device: str | torch.device = "cpu",
+) -> Tensor:
+    """Pre-compute the static scaling factor for sinusoidal time embeddings.
+
+    The scaling factor only depends on dimension, min/max period, and device —
+    not on the input timestep. Pre-computing it avoids redundant linspace, pow,
+    and reciprocal operations on every call.
+
+    Args:
+        dimension: Embedding dimension (must be even).
+        min_period: Minimum sinusoidal period.
+        max_period: Maximum sinusoidal period.
+        device: Target device.
+
+    Returns:
+        Scaling factor tensor [dimension // 2].
+    """
+    if dimension % 2 != 0:
+        raise ValueError(f"dimension ({dimension}) must be divisible by 2")
+
+    device = torch.device(device)
+    dtype = get_safe_dtype(torch.float64, device.type)
+    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
+    period = min_period * (max_period / min_period) ** fraction
+    scaling_factor = 1.0 / period * 2 * math.pi
+    return scaling_factor
+
+
 def create_sinusoidal_pos_embedding(
     time: torch.Tensor,
     dimension: int,
     min_period: float,
     max_period: float,
     device: str | torch.device = "cpu",
+    scaling_factor: Tensor | None = None,
 ) -> Tensor:
     """Create sinusoidal positional embeddings for scalar timesteps.
     
@@ -87,6 +120,8 @@ def create_sinusoidal_pos_embedding(
         min_period: Minimum sinusoidal period.
         max_period: Maximum sinusoidal period.
         device: Target device.
+        scaling_factor: Optional pre-computed scaling factor [dimension // 2].
+            If provided, skips the linspace/pow/reciprocal computation.
         
     Returns:
         Positional embeddings [batch_size, dimension].
@@ -100,15 +135,11 @@ def create_sinusoidal_pos_embedding(
     if time.ndim != 1:
         raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
 
-    # Use float64 for precision, with device compatibility fallback
-    dtype = get_safe_dtype(torch.float64, device.type)
-    
-    # Create log-spaced frequencies
-    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
-    period = min_period * (max_period / min_period) ** fraction
+    if scaling_factor is None:
+        scaling_factor = compute_sinusoidal_scaling_factor(
+            dimension, min_period, max_period, device)
 
-    # Compute sinusoidal embedding
-    scaling_factor = 1.0 / period * 2 * math.pi
+    # Compute sinusoidal embedding using (cached) scaling factor
     sin_input = scaling_factor[None, :] * time[:, None]
     pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
     
