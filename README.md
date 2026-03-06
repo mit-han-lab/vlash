@@ -44,6 +44,7 @@ conda create -n "vlash" python=3.10
 conda activate vlash
 conda install ffmpeg=7.1.1 -c conda-forge
 pip install -e .
+pip install -U torch torchvision torchcodec
 ```
 
 ### Quick Examples
