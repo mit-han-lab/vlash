@@ -25,17 +25,25 @@ The key idea:
 - At inference, this enables asynchronous execution where the policy can
   start predicting the next chunk before the current one finishes
 
+Offset sampling:
+- The offset is drawn uniformly from [0, max_delay_steps] *independently* of
+  the sample's position inside its episode. Action positions that fall past
+  the episode end are still fetched (clamped to the last valid index) but
+  are masked out via ``action_is_pad``.
+
 State handling with offset:
 - offset == 0: Use original observation.state
 - offset > 0:
-    - For LIBERO training: use recorded future state s_{t+offset} (ground truth)
-    - Otherwise: use previous action a_{t+offset-1} as a proxy "future state"
+    - If ``use_state_ground_truth=True``: use recorded future state
+      ``s_{t+offset}`` (clamped to the last valid state at the episode end).
+    - Otherwise: use previous action ``a_{t+offset-1}`` as a proxy future
+      state (clamped the same way). This path requires
+      ``state_dim == action_dim``.
 
-This matches the semantics used in nano-lerobot's apply_async_offset.
-
-SharedObservationVLASHDataset: An optimized variant that returns all offsets
-for a single observation, enabling shared observation training where
-observation embeddings are computed only once.
+SharedObservationVLASHDataset: An optimized variant that returns all
+``max_delay_steps + 1`` offset branches for a single observation, enabling
+shared observation training where observation embeddings are computed only
+once.
 """
 
 from pathlib import Path
@@ -95,7 +103,8 @@ class VLASHDataset(LeRobotDataset):
         """
         self.max_delay_steps = max_delay_steps
         # When True, offset state uses recorded future state s_{t+offset} instead of action proxy.
-        # This is required for LIBERO where state_dim != action_dim.
+        # Required when state_dim != action_dim, since the action-proxy path
+        # assumes they match.
         self.use_state_ground_truth = use_state_ground_truth
 
         super().__init__(
@@ -117,26 +126,29 @@ class VLASHDataset(LeRobotDataset):
 
     def _get_query_indices(self, idx: int, ep_idx: int) -> tuple[dict[str, list[int | bool]]]:
         """Get query indices with random temporal offset.
-        
-        Overrides parent to shift all delta_indices by a random offset
-        sampled from [0, max_delay_steps], respecting episode boundaries.
-        
+
+        Overrides parent to shift all delta_indices by a random offset sampled
+        uniformly from [0, max_delay_steps].`
+
         Args:
             idx: Sample index in dataset.
             ep_idx: Episode index.
-            
+
         Returns:
             Tuple of (query_indices, padding_masks).
         """
-        # Get episode boundaries
+        # Get episode boundaries (used for clamping/padding, not for offset range).
         ep = self.meta.episodes[ep_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
 
-        # Compute maximum valid offset (don't exceed episode boundary)
-        max_delta = self.delta_indices["action"][-1]
-        max_offset = min(self.max_delay_steps, max(0, ep_end - 1 - (idx + max_delta)))
-        offset = random.randint(0, max_offset) if max_offset > 0 else 0
+        # Sample offset uniformly in [0, max_delay_steps]; let action_is_pad
+        # below handle any action positions that land past the episode end.
+        offset = (
+            random.randint(0, self.max_delay_steps)
+            if self.max_delay_steps > 0
+            else 0
+        )
 
         # Store for use in __getitem__
         self._last_offset = offset
@@ -146,11 +158,11 @@ class VLASHDataset(LeRobotDataset):
         padding: dict[str, torch.BoolTensor] = {}
 
         for key, delta_idx in self.delta_indices.items():
-            # Clamp indices to episode boundaries
+            # Clamp indices to episode boundaries so hf_dataset lookups stay valid.
             query_indices[key] = [
                 max(ep_start, min(ep_end - 1, idx + delta + offset)) for delta in delta_idx
             ]
-            # Mark padding for out-of-bounds indices
+            # Mark padding for out-of-bounds indices; loss masks these out.
             padding[f"{key}_is_pad"] = torch.BoolTensor(
                 [(idx + delta + offset < ep_start) | (idx + delta + offset >= ep_end) for delta in delta_idx]
             )
@@ -300,15 +312,19 @@ class SharedObservationVLASHDataset(VLASHDataset):
 
         return query_indices, padding
 
+    def _get_query_indices(
+        self, idx: int, ep_idx: int
+    ) -> tuple[dict[str, list[int]], dict[str, torch.BoolTensor]]:
+        """Produce ``offset == 0`` query indices for the shared-observation path."""
+        self._last_offset = 0
+        return self._get_query_indices_for_offset(idx, ep_idx, 0)
+
     def __getitem__(self, idx) -> dict:
-        """Get sample with all valid offsets.
-        
-        Returns a single observation with states and actions for all valid
-        offsets [0, max_offset].
-        
+        """Get sample with all offsets in [0, max_delay_steps].
+
         Args:
             idx: Sample index.
-            
+
         Returns:
             Dictionary containing:
             - observation.images.*: Shared images [C, H, W]
@@ -316,20 +332,19 @@ class SharedObservationVLASHDataset(VLASHDataset):
             - observation.state: States for all offsets [num_offsets, state_dim]
             - action: Actions for all offsets [num_offsets, chunk_size, action_dim]
             - action_is_pad: Padding masks [num_offsets, chunk_size]
-            - num_offsets: Number of valid offsets
+            - num_offsets: Number of offsets (always max_delay_steps + 1)
         """
-        # Get episode info
+        # Get episode info (used for clamping the state lookup near boundaries).
         ep_idx = self.hf_dataset[idx]["episode_index"].item()
         ep = self.meta.episodes[ep_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
-        
-        # Compute maximum valid offset for this sample
-        max_delta = self.delta_indices["action"][-1]
-        max_offset = min(self.max_delay_steps, max(0, ep_end - 1 - (idx + max_delta)))
-        num_offsets = max_offset + 1
-        
-        # Get base item with offset=0 (for shared observation)
+
+        # Always produce max_delay_steps + 1 offset branches. Any action
+        # positions that spill past the episode end are masked via
+        # action_is_pad in _get_query_indices_for_offset.
+        num_offsets = self.max_delay_steps + 1
+
         self._last_offset = 0
         base_item = super(VLASHDataset, self).__getitem__(idx)
         
