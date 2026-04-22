@@ -25,15 +25,25 @@ The key idea:
 - At inference, this enables asynchronous execution where the policy can
   start predicting the next chunk before the current one finishes
 
+Offset sampling:
+- The offset is drawn uniformly from [0, max_delay_steps] *independently* of
+  the sample's position inside its episode. Action positions that fall past
+  the episode end are still fetched (clamped to the last valid index) but
+  are masked out via ``action_is_pad``.
+
 State handling with offset:
 - offset == 0: Use original observation.state
-- offset > 0: Use previous action (a_{offset-1}) as state
+- offset > 0:
+    - If ``use_state_ground_truth=True``: use recorded future state
+      ``s_{t+offset}`` (clamped to the last valid state at the episode end).
+    - Otherwise: use previous action ``a_{t+offset-1}`` as a proxy future
+      state (clamped the same way). This path requires
+      ``state_dim == action_dim``.
 
-This matches the semantics used in nano-lerobot's apply_async_offset.
-
-SharedObservationVLASHDataset: An optimized variant that returns all offsets
-for a single observation, enabling shared observation training where
-observation embeddings are computed only once.
+SharedObservationVLASHDataset: An optimized variant that returns all
+``max_delay_steps + 1`` offset branches for a single observation, enabling
+shared observation training where observation embeddings are computed only
+once.
 """
 
 from pathlib import Path
@@ -72,6 +82,8 @@ class VLASHDataset(LeRobotDataset):
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
         max_delay_steps: int = 0,
+        *,
+        use_state_ground_truth: bool = False,
     ):
         """Initialize VLASH dataset.
         
@@ -90,6 +102,10 @@ class VLASHDataset(LeRobotDataset):
             max_delay_steps: Maximum temporal delay for augmentation.
         """
         self.max_delay_steps = max_delay_steps
+        # When True, offset state uses recorded future state s_{t+offset} instead of action proxy.
+        # Required when state_dim != action_dim, since the action-proxy path
+        # assumes they match.
+        self.use_state_ground_truth = use_state_ground_truth
 
         super().__init__(
             repo_id=repo_id,
@@ -110,26 +126,29 @@ class VLASHDataset(LeRobotDataset):
 
     def _get_query_indices(self, idx: int, ep_idx: int) -> tuple[dict[str, list[int | bool]]]:
         """Get query indices with random temporal offset.
-        
-        Overrides parent to shift all delta_indices by a random offset
-        sampled from [0, max_delay_steps], respecting episode boundaries.
-        
+
+        Overrides parent to shift all delta_indices by a random offset sampled
+        uniformly from [0, max_delay_steps].`
+
         Args:
             idx: Sample index in dataset.
             ep_idx: Episode index.
-            
+
         Returns:
             Tuple of (query_indices, padding_masks).
         """
-        # Get episode boundaries
+        # Get episode boundaries (used for clamping/padding, not for offset range).
         ep = self.meta.episodes[ep_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
 
-        # Compute maximum valid offset (don't exceed episode boundary)
-        max_delta = self.delta_indices["action"][-1]
-        max_offset = min(self.max_delay_steps, max(0, ep_end - 1 - (idx + max_delta)))
-        offset = random.randint(0, max_offset) if max_offset > 0 else 0
+        # Sample offset uniformly in [0, max_delay_steps]; let action_is_pad
+        # below handle any action positions that land past the episode end.
+        offset = (
+            random.randint(0, self.max_delay_steps)
+            if self.max_delay_steps > 0
+            else 0
+        )
 
         # Store for use in __getitem__
         self._last_offset = offset
@@ -139,11 +158,11 @@ class VLASHDataset(LeRobotDataset):
         padding: dict[str, torch.BoolTensor] = {}
 
         for key, delta_idx in self.delta_indices.items():
-            # Clamp indices to episode boundaries
+            # Clamp indices to episode boundaries so hf_dataset lookups stay valid.
             query_indices[key] = [
                 max(ep_start, min(ep_end - 1, idx + delta + offset)) for delta in delta_idx
             ]
-            # Mark padding for out-of-bounds indices
+            # Mark padding for out-of-bounds indices; loss masks these out.
             padding[f"{key}_is_pad"] = torch.BoolTensor(
                 [(idx + delta + offset < ep_start) | (idx + delta + offset >= ep_end) for delta in delta_idx]
             )
@@ -151,11 +170,13 @@ class VLASHDataset(LeRobotDataset):
         return query_indices, padding
 
     def __getitem__(self, idx) -> dict:
-        """Get sample with state constructed from previous action.
+        """Get sample with offset state.
         
-        When offset > 0, the observation.state is replaced with the
-        action from the previous timestep (t + offset - 1). This matches
-        the semantics of nano-lerobot's apply_async_offset.
+        When offset > 0:
+        - If use_state_ground_truth=True: observation.state is replaced with the
+          recorded state at timestep (t + offset) (clamped to episode bounds).
+        - Else: observation.state is replaced with the action from the previous
+          timestep (t + offset - 1) as a proxy future state (clamped).
         
         Args:
             idx: Sample index.
@@ -179,28 +200,31 @@ class VLASHDataset(LeRobotDataset):
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
 
-        # Index of the previous action (before the offset action chunk starts)
-        prev_idx = max(ep_start, min(ep_end - 1, idx + offset - 1))
-
-        # Fetch previous action to use as state
-        obs_state = item["observation.state"]
-        prev_action = self.hf_dataset[prev_idx]["action"]
-
-        # Validate dimensions
-        if obs_state.dim() != 1 or prev_action.dim() != 1:
-            raise ValueError("For now only support 1D state/action.")
-
-        state_dim = obs_state.shape[0]
-        action_dim = prev_action.shape[0]
-
-        if state_dim == action_dim:
-            # Dimensions match: use previous action as state
-            new_state = prev_action
+        if self.use_state_ground_truth:
+            # Use recorded future state s_{t+offset}
+            future_idx = max(ep_start, min(ep_end - 1, idx + offset))
+            new_state = self.hf_dataset[future_idx]["observation.state"]
         else:
-            raise ValueError(
-                f"Unsupported state_dim != action_dim combination "
-                "in VLASHDataset when applying async offset to observation.state. "
-            )
+            # Use previous action a_{t+offset-1} as proxy future state
+            prev_idx = max(ep_start, min(ep_end - 1, idx + offset - 1))
+            obs_state = item["observation.state"]
+            prev_action = self.hf_dataset[prev_idx]["action"]
+
+            # Validate dimensions
+            if obs_state.dim() != 1 or prev_action.dim() != 1:
+                raise ValueError("For now only support 1D state/action.")
+
+            state_dim = obs_state.shape[0]
+            action_dim = prev_action.shape[0]
+
+            if state_dim == action_dim:
+                new_state = prev_action
+            else:
+                raise ValueError(
+                    f"Unsupported state_dim != action_dim combination "
+                    "in VLASHDataset when applying async offset to observation.state. "
+                    "For LIBERO, set use_state_ground_truth=True."
+                )
 
         item["observation.state"] = new_state
 
@@ -235,6 +259,8 @@ class SharedObservationVLASHDataset(VLASHDataset):
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
         max_delay_steps: int = 0,
+        *,
+        use_state_ground_truth: bool = False,
     ):
         """Initialize SharedObservationVLASHDataset.
         
@@ -253,6 +279,7 @@ class SharedObservationVLASHDataset(VLASHDataset):
             video_backend=video_backend,
             batch_encoding_size=batch_encoding_size,
             max_delay_steps=max_delay_steps,
+            use_state_ground_truth=use_state_ground_truth,
         )
 
     def _get_query_indices_for_offset(
@@ -285,15 +312,19 @@ class SharedObservationVLASHDataset(VLASHDataset):
 
         return query_indices, padding
 
+    def _get_query_indices(
+        self, idx: int, ep_idx: int
+    ) -> tuple[dict[str, list[int]], dict[str, torch.BoolTensor]]:
+        """Produce ``offset == 0`` query indices for the shared-observation path."""
+        self._last_offset = 0
+        return self._get_query_indices_for_offset(idx, ep_idx, 0)
+
     def __getitem__(self, idx) -> dict:
-        """Get sample with all valid offsets.
-        
-        Returns a single observation with states and actions for all valid
-        offsets [0, max_offset].
-        
+        """Get sample with all offsets in [0, max_delay_steps].
+
         Args:
             idx: Sample index.
-            
+
         Returns:
             Dictionary containing:
             - observation.images.*: Shared images [C, H, W]
@@ -301,20 +332,19 @@ class SharedObservationVLASHDataset(VLASHDataset):
             - observation.state: States for all offsets [num_offsets, state_dim]
             - action: Actions for all offsets [num_offsets, chunk_size, action_dim]
             - action_is_pad: Padding masks [num_offsets, chunk_size]
-            - num_offsets: Number of valid offsets
+            - num_offsets: Number of offsets (always max_delay_steps + 1)
         """
-        # Get episode info
+        # Get episode info (used for clamping the state lookup near boundaries).
         ep_idx = self.hf_dataset[idx]["episode_index"].item()
         ep = self.meta.episodes[ep_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
-        
-        # Compute maximum valid offset for this sample
-        max_delta = self.delta_indices["action"][-1]
-        max_offset = min(self.max_delay_steps, max(0, ep_end - 1 - (idx + max_delta)))
-        num_offsets = max_offset + 1
-        
-        # Get base item with offset=0 (for shared observation)
+
+        # Always produce max_delay_steps + 1 offset branches. Any action
+        # positions that spill past the episode end are masked via
+        # action_is_pad in _get_query_indices_for_offset.
+        num_offsets = self.max_delay_steps + 1
+
         self._last_offset = 0
         base_item = super(VLASHDataset, self).__getitem__(idx)
         
@@ -336,24 +366,29 @@ class SharedObservationVLASHDataset(VLASHDataset):
             if offset == 0:
                 state = base_item["observation.state"]
             else:
-                # State is previous action (action at t + offset - 1)
-                prev_idx = max(ep_start, min(ep_end - 1, idx + offset - 1))
-                prev_action = self.hf_dataset[prev_idx]["action"]
-                
-                obs_state = base_item["observation.state"]
-                if obs_state.dim() != 1 or prev_action.dim() != 1:
-                    raise ValueError("For now only support 1D state/action.")
-                
-                state_dim = obs_state.shape[0]
-                action_dim = prev_action.shape[0]
-                
-                if state_dim == action_dim:
-                    state = prev_action
+                if self.use_state_ground_truth:
+                    future_idx = max(ep_start, min(ep_end - 1, idx + offset))
+                    state = self.hf_dataset[future_idx]["observation.state"]
                 else:
-                    raise ValueError(
-                        f"Unsupported state_dim != action_dim combination "
-                        "in SharedObservationVLASHDataset when applying async offset."
-                    )
+                    # State is previous action (action at t + offset - 1)
+                    prev_idx = max(ep_start, min(ep_end - 1, idx + offset - 1))
+                    prev_action = self.hf_dataset[prev_idx]["action"]
+
+                    obs_state = base_item["observation.state"]
+                    if obs_state.dim() != 1 or prev_action.dim() != 1:
+                        raise ValueError("For now only support 1D state/action.")
+
+                    state_dim = obs_state.shape[0]
+                    action_dim = prev_action.shape[0]
+
+                    if state_dim == action_dim:
+                        state = prev_action
+                    else:
+                        raise ValueError(
+                            f"Unsupported state_dim != action_dim combination "
+                            "in SharedObservationVLASHDataset when applying async offset. "
+                            "For LIBERO, set use_state_ground_truth=True."
+                        )
             states.append(state)
             
             # Get actions for this offset
